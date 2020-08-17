@@ -3,6 +3,7 @@
 # TODO: bid/ask size https://github.com/binance-exchange/binance-official-api-docs/blob/master/web-socket-streams.md#all-book-tickers-stream
 # TODO: futures
 # TODO: dust collection (when buying, check if there's dust and add it to the sold qty)
+# TODO: multi asset (fix USDT limits)
 
 import time
 from time import sleep
@@ -14,14 +15,21 @@ import traceback
 from twisted.internet import reactor
 
 PUBLIC_API_KEY = ''								# API KEYS FROM BINANCE.COM (NOT REQUIRED!)
-PRIVATE_API_KEY = ''	    						        # API KEYS FROM BINANCE.COM (NOT REQUIRED!)
-MAX_DEPTH = 3                                   # max number of intermediary assets in the chain
+PRIVATE_API_KEY = ''							        # API KEYS FROM BINANCE.COM (NOT REQUIRED!)
+MAX_DEPTH = 2                                   # max number of intermediary assets in the chain
 TAKER_FEE = 0.00075
 #TAKER_FEE = 0.0004
-CUTOFF_RESULT  = 0.999 #- 1*TAKER_FEE            # cuts if results is below this at any time during the search
+CUTOFF_RESULT  = 0.999 #- 1*TAKER_FEE           # cuts if results is below this at any time during the search
 CUTOFF_PORTION = 0.20                           # cuts if portion traded is below 20% TODO: multiply by asset value and cut a value
 EXEC_THRESHOLD = .05                            # minimum gain for execution (in base asset)
 BASE_ASSET = "USDT"
+
+# assets we consider as base assets
+# found with:
+# {symbol:len(p) for symbol, p in inverse_pairs.items() if len(p) > 50}
+# {'BNB': 92, 'BTC': 189, 'BUSD': 76, 'ETH': 85, 'USDT': 150} (as of 17/08/20)
+BASE_ASSET_LIST = [ "USDT", "BUSD" ]
+
 
 def round_down(n, decimals=0):
     multiplier = 10 ** decimals
@@ -167,6 +175,44 @@ def printAccountSummary():
     print( "dust price: {:.2f} {}".format( dustPrice, BASE_ASSET ) )
     print( "total: {:.2f} {}".format( baseAssetBalance+bnbPrice+dustPrice, BASE_ASSET ) )
 
+def execTradeStep(side, symbol, exec_qty, expected_price):
+    try:
+        if side == "buy":
+            order = client.order_market_buy(
+                symbol=symbol,
+                #quoteOrderQty=current_asset_qty)
+                quantity=exec_qty)
+            current_asset_qty = float(order['executedQty'])
+            print( "# [{}] executed, status: {}, new asset qty: {}".format(symbol, order['status'], current_asset_qty) )
+            #print( "fills: {}".format([{'price': fill['price'], 'qty': fill['qty']} for fill in order['fills']]) )
+            print( "# [{}] fills: {}".format(symbol, order['fills']) )
+            actual_price = float(order['fills'][0]['price'])
+            if actual_price <= expected_price:
+                print( "# [{}] OK".format(symbol)  )
+            else:
+                print( "# [{}] FAILED ({:.2%})".format(symbol, (actual_price/expected_price)-1) )
+        else:
+            order = client.order_market_sell(
+                symbol=symbol,
+                quantity=exec_qty)
+            current_asset_qty = float(order['cummulativeQuoteQty'])
+            print( "# [{}] executed, status: {}, new asset qty: {}".format(symbol, order['status'], current_asset_qty) )
+            print( "# [{}] fills: {}".format(symbol, order['fills']) )
+            actual_price = float(order['fills'][0]['price'])
+            if actual_price >= expected_price:
+                print( "# [{}] OK".format(symbol)  )
+            else:
+                print( "# [{}] FAILED ({:.2%})".format(symbol, (actual_price/expected_price)-1) )
+    except Exception as exc:
+        if not "code=-2010" in str(exc):
+            print( "# [{}] {}".format( symbol, exc ) )
+
+def finishTradeExecution(start):
+    end = time.time()
+    print( "  >> trade execution took {:.2f}s".format( end - start ) )
+
+    printAccountSummary()
+
 def execTrade(chain, trades, portionToSpend):
     if client is None:
         print( "error: something went wrong, client not connected" )
@@ -203,32 +249,40 @@ def execTrade(chain, trades, portionToSpend):
 
         if (to_asset+from_asset) == trades[i]:
             print( "> buying:  {}, current asset qty: {} {}".format(trades[i], current_asset_qty, chain[i]) )
-            print( "expected price:  {} (qty:{})".format(inverse_pairs[chain[i]][chain[i+1]].ask_price, inverse_pairs[chain[i]][chain[i+1]].ask_qty) )
-            exec_qty = computeExecQty( current_asset_qty / inverse_pairs[chain[i]][chain[i+1]].ask_price, trades[i] )
-            print( "expected: bought {:6f} {} spending {:.6f} {}".format(exec_qty, chain[i+1], exec_qty*inverse_pairs[chain[i]][chain[i+1]].ask_price, chain[i]))
-            order = client.order_market_buy(
-                symbol=trades[i],
-                quoteOrderQty=current_asset_qty)
-                #quantity=exec_qty)
-            current_asset_qty = float(order['executedQty'])
-            print( "executed, status: {}, new asset qty: {}".format(order['status'], current_asset_qty) )
-            #print( "fills: {}".format([{'price': fill['price'], 'qty': fill['qty']} for fill in order['fills']]) )
-            print( "fills: {}".format(order['fills']) )
-        else:
-            print( "selling: {}, current asset qty: {} {}".format(trades[i], current_asset_qty, chain[i]) )
-            print( "expected price:  {} (qty:{})".format(pairs[chain[i]][chain[i+1]].bid_price, pairs[chain[i]][chain[i+1]].bid_qty) )
-            exec_qty = computeExecQty( current_asset_qty, trades[i] )
-            print( "expected: sold {:6f} {} receiving {:.6f} {}".format(exec_qty, chain[i], exec_qty*pairs[chain[i]][chain[i+1]].bid_price, chain[i+1]))
-            order = client.order_market_sell(
-                symbol=trades[i],
-                quantity=exec_qty)
-            current_asset_qty = float(order['cummulativeQuoteQty'])
-            print( "executed, status: {}, new asset qty: {}".format(order['status'], current_asset_qty) )
-            print( "fills: {}".format(order['fills']) )
-    end = time.time()
-    print( "   trade execution took {:.2f}s".format( end - start ) )
+            expected_price = inverse_pairs[chain[i]][chain[i+1]].ask_price
+            print( "expected: ask: {} qty: {}".format(expected_price, inverse_pairs[chain[i]][chain[i+1]].ask_qty) )
+            exec_qty = computeExecQty( current_asset_qty / expected_price, trades[i] )
+            print( "expected: bought {:6f} {} spending {:.6f} {}".format(exec_qty, chain[i+1], exec_qty*expected_price, chain[i]))
+            
+            for j in range (0,3*i+1):
+                reactor.callInThread(execTradeStep, "buy", trades[i], exec_qty, expected_price)
+                time.sleep(0.05)
+            
+            time.sleep(max(0, 0.15-(3*i+1)*0.05))
 
-    printAccountSummary()
+            # assume everything is fine, we'll handle errors later
+            current_asset_qty = exec_qty
+        else:
+            print( "> selling: {}, current asset qty: {} {}".format(trades[i], current_asset_qty, chain[i]) )
+            expected_price = pairs[chain[i]][chain[i+1]].bid_price
+            print( "expected: bid: {} qty: {}".format(expected_price, pairs[chain[i]][chain[i+1]].bid_qty) )
+            exec_qty = computeExecQty( current_asset_qty, trades[i] )
+            expect_received = exec_qty*expected_price
+            print( "expected: sold {:6f} {} receiving {:.6f} {}".format(exec_qty, chain[i], expect_received, chain[i+1]))
+
+            for j in range (0,3*i+1):
+                reactor.callInThread(execTradeStep, "sell", trades[i], exec_qty, expected_price)
+                time.sleep(0.05)
+            
+            time.sleep(max(0, 0.15-(3*i+1)*0.05))
+
+            # assume everything is fine, we'll handle errors later
+            current_asset_qty = expect_received
+
+    end = time.time()
+    print( "  >> trade loop execution took {:.2f}s".format( end - start ) )
+
+    reactor.callInThread(finishTradeExecution, start)
 
 def update_currency(currency):
     x = currency_container( currency )
@@ -360,7 +414,14 @@ if __name__ == "__main__":
     try:
         client = Client(PUBLIC_API_KEY, PRIVATE_API_KEY)
 
-        baseAssetBalance = float(client.get_asset_balance(asset=BASE_ASSET)['free'])
+        usdtBalance = float(client.get_asset_balance(asset='USDT')['free'])
+        busdBalance = float(client.get_asset_balance(asset='BUSD')['free'])
+        if usdtBalance >= busdBalance:
+            BASE_ASSET = 'USDT'
+            baseAssetBalance = usdtBalance
+        else:
+            BASE_ASSET = 'BUSD'
+            baseAssetBalance = busdBalance
 
         getExchangeInfo()
 
