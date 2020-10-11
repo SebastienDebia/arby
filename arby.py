@@ -23,12 +23,15 @@ CUTOFF_RESULT  = 0.999 #- 1*TAKER_FEE           # cuts if results is below this 
 CUTOFF_PORTION = 0.20                           # cuts if portion traded is below 20% TODO: multiply by asset value and cut a value
 EXEC_THRESHOLD = .05                            # minimum gain for execution (in base asset)
 BASE_ASSET = "USDT"
+BASE_ASSET = "EUR"
+DISCOUNTED_BASE = "EUR"                         # promotion, fee=0 for EUR
 
 # assets we consider as base assets
 # found with:
 # {symbol:len(p) for symbol, p in inverse_pairs.items() if len(p) > 50}
 # {'BNB': 92, 'BTC': 189, 'BUSD': 76, 'ETH': 85, 'USDT': 150} (as of 17/08/20)
 BASE_ASSET_LIST = [ "USDT", "BUSD" ]
+BASE_ASSET_LIST = [ "EUR" ]
 
 
 def round_down(n, decimals=0):
@@ -65,11 +68,43 @@ class currency_container:
         self.ask_price = float(currencyArray[askPrice_id])									#best ask price
         self.ask_qty   = float(currencyArray[askQty_id])									#best ask qty
 
-def explore(currentHolding, depth = 0, result = 1., spentPortionUpstream = 1., initialHolding = None):
-    if currentHolding == initialHolding:
+def computeChainResult(chain, trades, startQty):
+    result = startQty
+
+    fee_count = 0
+
+    for i in range( len(trades) ):
+        from_asset = chain[i]
+        to_asset = chain[i+1]
+
+        if (to_asset+from_asset) == trades[i]:
+            expected_price = inverse_pairs[chain[i]][chain[i+1]].ask_price
+            result = result / expected_price
+            if from_asset != DISCOUNTED_BASE:
+                fee_count += 1
+        else:
+            expected_price = pairs[chain[i]][chain[i+1]].bid_price
+            result = result * expected_price
+            if to_asset != DISCOUNTED_BASE:
+                fee_count += 1
+    
+    result *= ( 1. - fee_count * TAKER_FEE )
+
+    return result
+
+def explore(currentHolding,
+            initialHolding,
+            initialBalance,
+            depth = 0,
+            result = 1.,
+            spentPortionUpstream = 1.,
+            minimumSpent = CUTOFF_PORTION,
+            resultCutoff = CUTOFF_RESULT,
+            feeCount = 0 ):
+    if depth > 0 and currentHolding == BASE_ASSET:
         # the chain is finished, we're back to the original asset
         # remove the taker fee now it was ignored until now
-        result = result * ( 1. - depth * TAKER_FEE )
+        result = result * ( 1. - feeCount * TAKER_FEE )
         return (result, spentPortionUpstream, [currentHolding], [])
 
     if initialHolding is None:
@@ -84,17 +119,17 @@ def explore(currentHolding, depth = 0, result = 1., spentPortionUpstream = 1., i
         return (bestResult, bestSpentPortion, bestChain, bestTrades)
 
     # cutoff if the result is already too bad
-    if spentPortionUpstream < CUTOFF_PORTION:
+    if spentPortionUpstream < minimumSpent:
         return (bestResult, bestSpentPortion, bestChain, bestTrades)
     if currentHolding in inverse_pairs:
         if initialHolding in inverse_pairs[currentHolding]:
-            boughtQty = ( result / inverse_pairs[currentHolding][initialHolding].ask_price ) * ( 1. - depth * TAKER_FEE )
-            if boughtQty/spentPortionUpstream/baseAssetBalance < CUTOFF_RESULT:
+            boughtQty = ( result / inverse_pairs[currentHolding][initialHolding].ask_price ) * ( 1. - feeCount * TAKER_FEE )
+            if boughtQty/spentPortionUpstream/initialBalance < resultCutoff:
                 return (bestResult, bestSpentPortion, bestChain, bestTrades)
     if currentHolding in pairs:
         if initialHolding in pairs[currentHolding]:
-            soldQty = ( result * pairs[currentHolding][initialHolding].bid_price ) * ( 1. - depth * TAKER_FEE )
-            if soldQty/spentPortionUpstream/baseAssetBalance < CUTOFF_RESULT:
+            soldQty = ( result * pairs[currentHolding][initialHolding].bid_price ) * ( 1. - feeCount * TAKER_FEE )
+            if soldQty/spentPortionUpstream/initialBalance < resultCutoff:
                 return (bestResult, bestSpentPortion, bestChain, bestTrades)
 
     # search for good deals
@@ -111,9 +146,12 @@ def explore(currentHolding, depth = 0, result = 1., spentPortionUpstream = 1., i
             if computeExecQty( spentPortion * result, pair.symbol ) < 1.1 * float(symbols_info[pair.symbol]['min_notional']['minNotional']):
                 continue
 
-            locResult, locSpentPortion, chain, trades = explore( pair.first_symbol, depth+1, boughtQty, originalAssetSpent, initialHolding )
+            newFee = 1
+            if pair.second_symbol == DISCOUNTED_BASE:
+                newFee = 0
+            locResult, locSpentPortion, chain, trades = explore( pair.first_symbol, initialHolding, initialBalance, depth+1, boughtQty, originalAssetSpent, feeCount=feeCount+newFee )
 
-            if locResult - baseAssetBalance*locSpentPortion > bestResult - baseAssetBalance*bestSpentPortion:
+            if locResult - initialBalance*locSpentPortion > bestResult - initialBalance*bestSpentPortion:
                 bestResult = locResult
                 bestSpentPortion = locSpentPortion
                 bestChain = [currentHolding]
@@ -133,9 +171,12 @@ def explore(currentHolding, depth = 0, result = 1., spentPortionUpstream = 1., i
             if computeExecQty( boughtQty, pair.symbol ) < 1.1 * float(symbols_info[pair.symbol]['min_notional']['minNotional']):
                 continue
             
-            locResult, locSpentPortion, chain, trades = explore( pair.second_symbol, depth+1, boughtQty, originalAssetSpent, initialHolding )
+            newFee = 1
+            if pair.first_symbol == DISCOUNTED_BASE:
+                newFee = 0
+            locResult, locSpentPortion, chain, trades = explore( pair.second_symbol, initialHolding, initialBalance, depth+1, boughtQty, originalAssetSpent, feeCount=feeCount+newFee )
 
-            if locResult - baseAssetBalance*locSpentPortion > bestResult - baseAssetBalance*bestSpentPortion:
+            if locResult - initialBalance*locSpentPortion > bestResult - initialBalance*bestSpentPortion:
                 bestResult = locResult
                 bestSpentPortion = locSpentPortion
                 bestChain = [currentHolding]
@@ -147,14 +188,15 @@ def explore(currentHolding, depth = 0, result = 1., spentPortionUpstream = 1., i
 
 def findTrades():
     #print( "scan...")
-    result, spentPortion, chain, trades = explore( BASE_ASSET, result = baseAssetBalance )
     findTrades.last_result = False
+    result, spentPortion, chain, trades = explore( BASE_ASSET, BASE_ASSET, baseAssetBalance, result = baseAssetBalance )
     PnL_ratio = (result/spentPortion)/baseAssetBalance
     PnL = result - baseAssetBalance * spentPortion
     if PnL >= EXEC_THRESHOLD:
         if findTrades.last_result == False:
             findTrades.start = time.time()
         findTrades.last_result = True
+        print( '' )
         print( "### executing a trade ###" )
         print( "{0:.2%} {1:.2f}{2} assets:{3} trades:{4} spending:{5:.0%}".format(PnL_ratio-1, PnL, BASE_ASSET, chain, trades, spentPortion) )
         execTrade(chain, trades, spentPortion)
@@ -175,93 +217,81 @@ def printAccountSummary():
     print( "dust price: {:.2f} {}".format( dustPrice, BASE_ASSET ) )
     print( "total: {:.2f} {}".format( baseAssetBalance+bnbPrice+dustPrice, BASE_ASSET ) )
 
-def execTradeStep(side, symbol, exec_qty, expected_price):
+def execTradeStep(i, chain, trades, current_asset_qty, initialBalance):
+    EXECUTION_DISABLED = False
+
+    # reassess the situation
+    currentChainResult = computeChainResult(chain[i:], trades[i:], current_asset_qty) / initialBalance
+
+    print( "computed Chain Result: {0:.2%}".format(currentChainResult-1) )
+    if i == 0:
+        if currentChainResult < 1.:
+            print( "### It's a trap! stopping here ###" )
+            reactor.callLater(.001, finishTradeExecution)
+            return
+
+    if i > 0:
+        if currentChainResult < 1. and chain[i] in BASE_ASSET_LIST:
+            global BASE_ASSET
+            print( "### It's a trap! stopping here ###" )
+            BASE_ASSET = chain[i]
+            baseAssetBalance = account_info['balances_free'][chain[i]]
+            print( "### new base asset: {} ###".format(BASE_ASSET) )
+            reactor.callLater(.001, finishTradeExecution)
+            return
+    
+    if i > 0:
+        resultCutoff = max( min( CUTOFF_RESULT, currentChainResult ), .99 )
+        newResult, newSpentPortion, newChain, newTrades = explore( chain[i], chain[0], initialBalance, result = current_asset_qty, minimumSpent = .99, resultCutoff = resultCutoff )
+        currentChainResult = currentChainResult * initialBalance
+        if newChain != chain and newResult > currentChainResult:
+            PnL_ratio = newResult / initialBalance
+            PnL = newResult - initialBalance
+            spentPortion = newSpentPortion
+            print( "-= found a new route to finish the trade =-" )
+            print( "{0:.2%} {1:.2f}{2} assets:{3} trades:{4} spending:{5:.0%}".format(PnL_ratio-1, PnL, BASE_ASSET, chain, trades, spentPortion) )
+            chain = newChain
+            trades = newTrades
+            i = 0
+
+    from_asset = chain[i]
+    to_asset = chain[i+1]
+
+    side = ""
+    if (to_asset+from_asset) == trades[i]:
+        side = "buy"
+    else:
+        side = "sell"
+
+    symbol = trades[i]
+
     try:
         if side == "buy":
-            order = client.order_market_buy(
-                symbol=symbol,
-                #quoteOrderQty=current_asset_qty)
-                quantity=exec_qty)
-            current_asset_qty = float(order['executedQty'])
-            print( "# [{}] executed, status: {}, new asset qty: {}".format(symbol, order['status'], current_asset_qty) )
-            #print( "fills: {}".format([{'price': fill['price'], 'qty': fill['qty']} for fill in order['fills']]) )
-            print( "# [{}] fills: {}".format(symbol, order['fills']) )
-            actual_price = float(order['fills'][0]['price'])
-            if actual_price <= expected_price:
-                print( "# [{}] OK".format(symbol)  )
-            else:
-                print( "# [{}] FAILED ({:.2%})".format(symbol, (actual_price/expected_price)-1) )
-        else:
-            order = client.order_market_sell(
-                symbol=symbol,
-                quantity=exec_qty)
-            current_asset_qty = float(order['cummulativeQuoteQty'])
-            print( "# [{}] executed, status: {}, new asset qty: {}".format(symbol, order['status'], current_asset_qty) )
-            print( "# [{}] fills: {}".format(symbol, order['fills']) )
-            actual_price = float(order['fills'][0]['price'])
-            if actual_price >= expected_price:
-                print( "# [{}] OK".format(symbol)  )
-            else:
-                print( "# [{}] FAILED ({:.2%})".format(symbol, (actual_price/expected_price)-1) )
-    except Exception as exc:
-        if not "code=-2010" in str(exc):
-            print( "# [{}] {}".format( symbol, exc ) )
-
-def finishTradeExecution(start):
-    end = time.time()
-    print( "  >> trade execution took {:.2f}s".format( end - start ) )
-
-    printAccountSummary()
-
-def execTrade(chain, trades, portionToSpend):
-    if client is None:
-        print( "error: something went wrong, client not connected" )
-        return
-    if len(trades) < 2:
-        print( "error: a chain should involve at least 2 trades")
-        return
-    if len(chain) - len(trades) != 1:
-        print( "error: there should be one more asset than trades")
-        return
-    
-    if False:
-        print( "execution disabled!" )
-        return
-
-    # the query takes 0.32s ...
-    #balance = float(client.get_asset_balance(asset=BASE_ASSET)['free'])
-    balance = baseAssetBalance
-    print( "{} balance: {:.2f}".format( BASE_ASSET, balance ) )
-    current_asset_qty = balance * portionToSpend
-    current_asset_qty = fixAssetPrecision( current_asset_qty, 'BTC'+BASE_ASSET )
-
-    start = time.time()
-    for i in range( len(trades) ):
-        from_asset = chain[i]
-        to_asset = chain[i+1]
-
-        #balance = float(client.get_asset_balancùe(asset=from_asset)['free'])
-        #print( "{} balance: {:.2f}".format( from_asset, balance ) )
-        #quoteOrderQty = balance
-
-        # IOC: Immediate Or Cancel
-        # An order will try to fill the order as much as it can before the order expires
-
-        if (to_asset+from_asset) == trades[i]:
             print( "> buying:  {}, current asset qty: {} {}".format(trades[i], current_asset_qty, chain[i]) )
             expected_price = inverse_pairs[chain[i]][chain[i+1]].ask_price
             print( "expected: ask: {} qty: {}".format(expected_price, inverse_pairs[chain[i]][chain[i+1]].ask_qty) )
             exec_qty = computeExecQty( current_asset_qty / expected_price, trades[i] )
             print( "expected: bought {:6f} {} spending {:.6f} {}".format(exec_qty, chain[i+1], exec_qty*expected_price, chain[i]))
             
-            for j in range (0,3*i+1):
-                reactor.callInThread(execTradeStep, "buy", trades[i], exec_qty, expected_price)
-                time.sleep(0.05)
-            
-            time.sleep(max(0, 0.15-(3*i+1)*0.05))
-
             # assume everything is fine, we'll handle errors later
             current_asset_qty = exec_qty
+
+            if EXECUTION_DISABLED:
+                print( "execution disabled!" )
+            else:
+                order = client.order_market_buy(
+                    symbol=symbol,
+                    #quoteOrderQty=current_asset_qty)
+                    quantity=exec_qty)
+                current_asset_qty = float(order['executedQty'])
+                print( "# [{}] executed, status: {}, new asset qty: {}".format(symbol, order['status'], current_asset_qty) )
+                #print( "fills: {}".format([{'price': fill['price'], 'qty': fill['qty']} for fill in order['fills']]) )
+                print( "# [{}] fills: {}".format(symbol, order['fills']) )
+                actual_price = float(order['fills'][0]['price'])
+                if actual_price <= expected_price:
+                    print( "# [{}] OK".format(symbol)  )
+                else:
+                    print( "# [{}] FAILED ({:.2%})".format(symbol, (actual_price/expected_price)-1) )
         else:
             print( "> selling: {}, current asset qty: {} {}".format(trades[i], current_asset_qty, chain[i]) )
             expected_price = pairs[chain[i]][chain[i+1]].bid_price
@@ -270,19 +300,82 @@ def execTrade(chain, trades, portionToSpend):
             expect_received = exec_qty*expected_price
             print( "expected: sold {:6f} {} receiving {:.6f} {}".format(exec_qty, chain[i], expect_received, chain[i+1]))
 
-            for j in range (0,3*i+1):
-                reactor.callInThread(execTradeStep, "sell", trades[i], exec_qty, expected_price)
-                time.sleep(0.05)
-            
-            time.sleep(max(0, 0.15-(3*i+1)*0.05))
-
             # assume everything is fine, we'll handle errors later
             current_asset_qty = expect_received
 
+            if EXECUTION_DISABLED:
+                print( "execution disabled!" )
+            else:
+                order = client.order_market_sell(
+                    symbol=symbol,
+                    quantity=exec_qty)
+                current_asset_qty = float(order['cummulativeQuoteQty'])
+                print( "# [{}] executed, status: {}, new asset qty: {}".format(symbol, order['status'], current_asset_qty) )
+                print( "# [{}] fills: {}".format(symbol, order['fills']) )
+                actual_price = float(order['fills'][0]['price'])
+                if actual_price >= expected_price:
+                    print( "# [{}] OK".format(symbol)  )
+                else:
+                    print( "# [{}] FAILED ({:.2%})".format(symbol, (actual_price/expected_price)-1) )
+    
+        if i+1 < len(trades):
+            reactor.callLater(.001, execTradeStep, i+1, chain, trades, current_asset_qty, initialBalance)
+        else:
+            reactor.callLater(.001, finishTradeExecution)
+
+    except Exception as exc:
+        #if not "code=-2010" in str(exc):
+        print( "# [{}] {}".format( symbol, exc ) )
+        if i > 0:
+            reactor.callLater(.001, execTradeStep, i, chain, trades, current_asset_qty, initialBalance)
+        else:
+            reactor.callLater(.001, finishTradeExecution)
+
+def finishTradeExecution():
+    global g_ongoing_trade
+    g_ongoing_trade = False
+
+    printAccountSummary()
+
+def execTrade(chain, trades, portionToSpend):
+    if client is None:
+        print( "error: something went wrong, client not connected" )
+        return
+    #if len(trades) < 2:
+    #    print( "error: a chain should involve at least 2 trades")
+    #    return
+    if len(chain) - len(trades) != 1:
+        print( "error: there should be one more asset than trades")
+        return
+
+    global g_ongoing_trade
+    g_ongoing_trade = True
+    
+    if False:
+        print( "execution disabled!" )
+        return
+
+    i = 0
+
+    balance = account_info['balances_free'][chain[i]]
+    print( "{} balance: {:.2f}".format( chain[i], balance ) )
+    current_asset_qty = balance * portionToSpend
+    current_asset_qty = fixAssetPrecision( current_asset_qty, 'BTC'+BASE_ASSET )
+
+    start = time.time()
+
+    #balance = float(client.get_asset_balance(asset=from_asset)['free'])
+    #print( "{} balance: {:.2f}".format( from_asset, balance ) )
+    #quoteOrderQty = balance
+
+    # IOC: Immediate Or Cancel
+    # An order will try to fill the order as much as it can before the order expires
+
+    # not a direct call, so that we can realise before stepping in a trap :)
+    reactor.callLater(.001, execTradeStep, i, chain, trades, current_asset_qty, current_asset_qty )
+
     end = time.time()
     print( "  >> trade loop execution took {:.2f}s".format( end - start ) )
-
-    reactor.callInThread(finishTradeExecution, start)
 
 def update_currency(currency):
     x = currency_container( currency )
@@ -314,15 +407,29 @@ def process_message(msg):
 process_message.last_ts = time.time()
 process_message.rolling_avg = 0
 
+def process_user_message(msg):
+    global account_info
+    try:
+        if 'e' in msg and msg['e'] == 'outboundAccountInfo':
+            account_info['balances_free'] = { bal['a']:float(bal['f']) for bal in msg['B'] }
+    except Exception as exc:
+        print( traceback.format_exc() )
+
+
 def scan():
+    global g_ongoing_trade
     start = time.time()
     try:
-        findTrades()
+        if not g_ongoing_trade:
+            findTrades()
     except Exception:
         print( traceback.format_exc() )
     end = time.time()
     #print( "scan took {:.2f}s ({} pairs)".format( end - start, len(pairs) ) )
-    reactor.callLater(.001, scan)
+    if not g_ongoing_trade:
+        reactor.callLater(.001, scan)
+    else:
+        reactor.callLater(.1, scan)
     #print( process_message.rolling_avg )
     scan.just_done = True
 scan.just_done = False
@@ -337,11 +444,11 @@ def getExchangeInfo():
         symbol['precision'] = int(round(-math.log(float(symbol['lot_size']['stepSize']), 10), 0))
         symbols_info[symbol['symbol']] = symbol
 
-def get_price( qty, asset, target_asset, depth = 0 ):
+def get_price( qty, asset, target_asset, depth = 0, feeCount = 0 ):
     if asset == target_asset:
         # the chain is finished, we reached the target asset
         # remove the taker fee now it was ignored until now
-        qty = qty * ( 1. - depth * TAKER_FEE )
+        qty = qty * ( 1. - feeCount * TAKER_FEE )
         return (qty, [asset], [])
 
     if depth > 2:
@@ -359,7 +466,10 @@ def get_price( qty, asset, target_asset, depth = 0 ):
             spentPortion = 1.
             boughtQty = ( spentPortion * qty / pair.ask_price ) # * ( 1. - TAKER_FEE ) binance gets the fee in a different currency 
 
-            locResult, chain, trades = get_price( boughtQty, pair.first_symbol, target_asset, depth+1 )
+            newFee = 1
+            if pair.second_symbol == DISCOUNTED_BASE:
+                newFee = 0
+            locResult, chain, trades = get_price( boughtQty, pair.first_symbol, target_asset, depth+1,  feeCount+newFee )
 
             if locResult != -1 and len(chain) < shortestChain:
                 shortestChain = len(chain)
@@ -377,7 +487,10 @@ def get_price( qty, asset, target_asset, depth = 0 ):
             spentPortion = 1.
             boughtQty = ( spentPortion * qty * pair.bid_price ) # * ( 1. - TAKER_FEE ) binance gets the fee in a different currency
             
-            locResult, chain, trades = get_price( boughtQty, pair.second_symbol, target_asset, depth+1 )
+            newFee = 1
+            if pair.first_symbol == DISCOUNTED_BASE:
+                newFee = 0
+            locResult, chain, trades = get_price( boughtQty, pair.second_symbol, target_asset, depth+1, feeCount+newFee )
 
             if locResult != -1 and len(chain) < shortestChain:
                 shortestChain = len(chain)
@@ -388,13 +501,13 @@ def get_price( qty, asset, target_asset, depth = 0 ):
                 bestTrades.extend( trades )
             
             if shortestChain == depth+1:
-                break;
+                break
     
     return (bestResult, bestChain, bestTrades)
 
 def get_dust_price():
-    account = client.get_account()
-    balances = {b['asset']: float(b['free']) for b in account['balances']}
+    global account_info
+    balances = account_info['balances_free']
     total_value = 0
     for ticker, amount in balances.items():
         if amount > 0:
@@ -405,23 +518,35 @@ def get_dust_price():
 
 
 client = None
-if __name__ == "__main__":
-    pairs = {}
-    inverse_pairs = {}
-    baseAssetBalance = 0.01
+account_info = {}
+pairs = {}
+inverse_pairs = {}
+baseAssetBalance = 0.01
+g_ongoing_trade = False
 
+if __name__ == "__main__":
     print( "Arby the bot starting..." )
     try:
         client = Client(PUBLIC_API_KEY, PRIVATE_API_KEY)
 
-        usdtBalance = float(client.get_asset_balance(asset='USDT')['free'])
-        busdBalance = float(client.get_asset_balance(asset='BUSD')['free'])
-        if usdtBalance >= busdBalance:
-            BASE_ASSET = 'USDT'
-            baseAssetBalance = usdtBalance
+        start = time.time()
+        account = client.get_account()
+        account_info['balances_free'] = {b['asset']: float(b['free']) for b in account['balances']}
+        end = time.time()
+        print( "query time: {:.2f}".format( end-start ) )
+
+        # EUR override
+        if BASE_ASSET == "EUR":
+            baseAssetBalance = account_info['balances_free']['EUR']
         else:
-            BASE_ASSET = 'BUSD'
-            baseAssetBalance = busdBalance
+            usdtBalance = account_info['balances_free']['USDT']
+            busdBalance = account_info['balances_free']['BUSD']
+            if usdtBalance >= busdBalance:
+                BASE_ASSET = 'USDT'
+                baseAssetBalance = usdtBalance
+            else:
+                BASE_ASSET = 'BUSD'
+                baseAssetBalance = busdBalance
 
         getExchangeInfo()
 
@@ -431,6 +556,7 @@ if __name__ == "__main__":
 
         bm = BinanceSocketManager(client)
         conn_key = bm.start_book_ticker_socket(process_message)
+        conn_key_usr = bm.start_user_socket(process_user_message)
         bm.start()
 
         reactor.callLater(5, scan)
